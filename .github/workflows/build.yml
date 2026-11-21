@@ -785,22 +785,103 @@ jobs:
       - name: Add google-services.json
         env:
           GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
         run: |
           python3 - <<'PY'
-          import os, json, sys
-          raw = os.environ["GS"]
-          clean = "".join(ch for ch in raw if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
-          print("Hidden/non-ASCII characters removed:", len(raw) - len(clean))
-          try:
-              data = json.loads(clean)
-          except Exception as e:
-              print("::error::google-services.json is not valid JSON:", e)
+          import os, sys, json, base64, subprocess, tempfile, time, urllib.request, urllib.parse, urllib.error
+
+          PKG = "com.renna.app"
+
+          def sanitize(raw):
+              return "".join(ch for ch in raw if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
+
+          def names_of(data):
+              try:
+                  return [c.get("client_info", {}).get("android_client_info", {}).get("package_name") for c in data.get("client", [])]
+              except Exception:
+                  return []
+
+          def skeleton(x):
+              if isinstance(x, dict):
+                  return {k: skeleton(v) for k, v in x.items()}
+              if isinstance(x, list):
+                  return [skeleton(v) for v in x]
+              return "..."
+
+          def check(label, raw):
+              print("--- Source:", label)
+              if not raw or not raw.strip():
+                  print("empty")
+                  return None
+              clean = sanitize(raw)
+              print("characters:", len(raw), "| removed hidden:", len(raw) - len(clean))
+              try:
+                  data = json.loads(clean)
+              except Exception as e:
+                  print("not valid JSON:", e)
+                  return None
+              print("structure (values hidden):", json.dumps(skeleton(data))[:1200])
+              names = names_of(data)
+              print("package names found:", names)
+              return data if PKG in names else None
+
+          def b64u(b):
+              return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+          def from_api():
+              print("--- Source: Firebase API using the service account")
+              keyfile = None
+              try:
+                  sa = json.loads(sanitize(os.environ.get("SA", "")))
+                  now = int(time.time())
+                  head = b64u(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+                  claim = b64u(json.dumps({
+                      "iss": sa["client_email"],
+                      "scope": "https://www.googleapis.com/auth/cloud-platform",
+                      "aud": "https://oauth2.googleapis.com/token",
+                      "iat": now, "exp": now + 3600}).encode())
+                  with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+                      f.write(sa["private_key"])
+                      keyfile = f.name
+                  sig = subprocess.run(["openssl", "dgst", "-sha256", "-sign", keyfile],
+                                       input=(head + "." + claim).encode(), capture_output=True, check=True).stdout
+                  jwt = head + "." + claim + "." + b64u(sig)
+                  body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jwt}).encode()
+                  tok = json.load(urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=body), timeout=30))["access_token"]
+
+                  def get(url):
+                      req = urllib.request.Request(url, headers={"Authorization": "Bearer " + tok})
+                      return json.load(urllib.request.urlopen(req, timeout=30))
+
+                  pid = sa["project_id"]
+                  apps = get("https://firebase.googleapis.com/v1beta1/projects/%s/androidApps" % pid).get("apps", [])
+                  print("android apps in project:", [a.get("packageName") for a in apps])
+                  app = next((a for a in apps if a.get("packageName") == PKG), None)
+                  if not app:
+                      return None
+                  cfg = get("https://firebase.googleapis.com/v1beta1/projects/%s/androidApps/%s/config" % (pid, app["appId"]))
+                  data = json.loads(base64.b64decode(cfg["configFileContents"]))
+                  print("package names found:", names_of(data))
+                  return data if PKG in names_of(data) else None
+              except urllib.error.HTTPError as e:
+                  print("API error:", e.code, e.read().decode(errors="ignore")[:300])
+              except Exception as e:
+                  print("API failed:", repr(e)[:300])
+              finally:
+                  if keyfile and os.path.exists(keyfile):
+                      os.remove(keyfile)
+              return None
+
+          data = check("secret GOOGLE_SERVICES_JSON", os.environ.get("GS", ""))
+          if data is None and os.path.exists("google-services.json"):
+              with open("google-services.json", encoding="utf-8", errors="ignore") as f:
+                  data = check("file google-services.json in the repository", f.read())
+          if data is None:
+              data = from_api()
+          if data is None:
+              print("::error::Could not obtain a google-services.json containing package com.renna.app. See the log above.")
               sys.exit(1)
-          names = [c.get("client_info", {}).get("android_client_info", {}).get("package_name") for c in data.get("client", [])]
-          print("Package names found in file:", names)
-          if "com.renna.app" not in names:
-              print("::error::No client with package com.renna.app. Found:", names)
-              sys.exit(1)
+          os.makedirs("renna/app", exist_ok=True)
           with open("renna/app/google-services.json", "w") as f:
               json.dump(data, f, indent=2)
           print("google-services.json written OK")
