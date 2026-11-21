@@ -1,0 +1,798 @@
+name: Build Renna APK
+# Run manually from the Actions tab. Deploys the server to Cloudflare, then builds the APK and publishes it in Releases.
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check secrets
+        env:
+          GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          CF: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          fail() { echo "::error::$1"; exit 1; }
+          [ -n "$GS" ] || fail "Missing secret GOOGLE_SERVICES_JSON"
+          [ -n "$SA" ] || fail "Missing secret FIREBASE_SERVICE_ACCOUNT"
+          [ -n "$CF" ] || fail "Missing secret CLOUDFLARE_API_TOKEN"
+          echo "$GS" | grep -q '"com.renna.app"' || fail "google-services.json does not contain package name com.renna.app"
+          echo "$SA" | grep -q '"private_key"' || fail "FIREBASE_SERVICE_ACCOUNT is not a valid service account key"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Generate project files
+        run: |
+          mkdir renna && cd renna
+          mkdir -p app
+          cat > app/build.gradle.kts <<'RENNA_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("com.google.gms.google-services")
+          }
+
+          android {
+              namespace = "com.renna.app"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.renna.app"
+                  minSdk = 31
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  buildConfigField("String", "SERVER_URL", "\"${System.getenv("WORKER_URL") ?: ""}\"")
+              }
+              buildFeatures { buildConfig = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation(platform("com.google.firebase:firebase-bom:33.1.2"))
+              implementation("com.google.firebase:firebase-messaging-ktx")
+          }
+          RENNA_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.Renna">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".RennaService"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="com.google.firebase.MESSAGING_EVENT" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          RENNA_EOF
+          mkdir -p app/src/main/java/com/renna/app
+          cat > app/src/main/java/com/renna/app/Api.kt <<'RENNA_EOF'
+          package com.renna.app
+
+          import android.content.Context
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Api {
+              private fun post(path: String, body: JSONObject): Pair<Int, JSONObject?> {
+                  val conn = URL(BuildConfig.SERVER_URL.trimEnd('/') + path).openConnection() as HttpURLConnection
+                  try {
+                      conn.requestMethod = "POST"
+                      conn.connectTimeout = 15000
+                      conn.readTimeout = 15000
+                      conn.doOutput = true
+                      conn.setRequestProperty("Content-Type", "application/json")
+                      conn.outputStream.use { it.write(body.toString().toByteArray()) }
+                      val status = conn.responseCode
+                      val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+                      val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                      val json = try { JSONObject(text) } catch (e: Exception) { null }
+                      return Pair(status, json)
+                  } finally {
+                      conn.disconnect()
+                  }
+              }
+
+              /** Registers this phone's FCM token. Returns the permanent 8-digit code, or null on failure. */
+              fun register(ctx: Context, token: String, retry: Boolean = true): String? {
+                  val p = ctx.getSharedPreferences("renna", Context.MODE_PRIVATE)
+                  val body = JSONObject().put("token", token)
+                  p.getString("code", null)?.let { body.put("code", it) }
+                  p.getString("secret", null)?.let { body.put("secret", it) }
+                  val (status, json) = post("/register", body)
+                  if (status == 200 && json != null) {
+                      val code = json.getString("code")
+                      p.edit().putString("code", code)
+                          .putString("secret", json.getString("secret"))
+                          .putString("token", token).apply()
+                      return code
+                  }
+                  if (status == 403 && retry) {
+                      p.edit().remove("code").remove("secret").apply()
+                      return register(ctx, token, false)
+                  }
+                  return null
+              }
+
+              fun ring(code: String): Int = post("/ring", JSONObject().put("code", code)).first
+          }
+          RENNA_EOF
+          mkdir -p app/src/main/java/com/renna/app
+          cat > app/src/main/java/com/renna/app/MainActivity.kt <<'RENNA_EOF'
+          package com.renna.app
+
+          import android.Manifest
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.widget.EditText
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import com.google.android.material.button.MaterialButton
+          import com.google.firebase.messaging.FirebaseMessaging
+
+          class MainActivity : AppCompatActivity() {
+              private lateinit var tvCode: TextView
+              private lateinit var tvStatus: TextView
+              private lateinit var etInput: EditText
+              private lateinit var btnRing: MaterialButton
+
+              private val prefs get() = getSharedPreferences("renna", Context.MODE_PRIVATE)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+                  Notifier.ensureChannel(this)
+
+                  tvCode = findViewById(R.id.tvCode)
+                  tvStatus = findViewById(R.id.tvStatus)
+                  etInput = findViewById(R.id.etInput)
+                  btnRing = findViewById(R.id.btnRing)
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                      != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  findViewById<MaterialButton>(R.id.btnCopy).setOnClickListener {
+                      val code = prefs.getString("code", null) ?: return@setOnClickListener
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("renna", code))
+                      Toast.makeText(this, R.string.copied, Toast.LENGTH_SHORT).show()
+                  }
+                  findViewById<MaterialButton>(R.id.btnShare).setOnClickListener {
+                      val code = prefs.getString("code", null) ?: return@setOnClickListener
+                      val i = Intent(Intent.ACTION_SEND).apply {
+                          type = "text/plain"
+                          putExtra(Intent.EXTRA_TEXT, getString(R.string.share_text, code))
+                      }
+                      startActivity(Intent.createChooser(i, getString(R.string.share)))
+                  }
+                  btnRing.setOnClickListener { sendRing() }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  showCode(prefs.getString("code", null))
+                  registerThisPhone()
+              }
+
+              private fun showCode(code: String?) {
+                  tvCode.text = code ?: getString(R.string.creating_code)
+              }
+
+              private fun registerThisPhone() {
+                  FirebaseMessaging.getInstance().token
+                      .addOnSuccessListener { token ->
+                          Thread {
+                              val code = try { Api.register(applicationContext, token) } catch (_: Exception) { null }
+                              runOnUiThread {
+                                  if (code != null) {
+                                      showCode(code)
+                                  } else if (prefs.getString("code", null) == null) {
+                                      tvCode.text = getString(R.string.code_failed)
+                                  }
+                              }
+                          }.start()
+                      }
+                      .addOnFailureListener {
+                          if (prefs.getString("code", null) == null) {
+                              tvCode.text = getString(R.string.code_failed)
+                          }
+                      }
+              }
+
+              private fun sendRing() {
+                  val code = etInput.text.toString().trim()
+                  if (code.length != 8) {
+                      tvStatus.text = getString(R.string.err_length)
+                      return
+                  }
+                  btnRing.isEnabled = false
+                  tvStatus.text = getString(R.string.sending)
+                  Thread {
+                      val status = try { Api.ring(code) } catch (_: Exception) { -1 }
+                      runOnUiThread {
+                          btnRing.isEnabled = true
+                          tvStatus.text = getString(
+                              when (status) {
+                                  200 -> R.string.sent
+                                  404, 410 -> R.string.err_not_found
+                                  429 -> R.string.err_wait
+                                  -1 -> R.string.err_network
+                                  else -> R.string.err_generic
+                              }
+                          )
+                      }
+                  }.start()
+              }
+          }
+          RENNA_EOF
+          mkdir -p app/src/main/java/com/renna/app
+          cat > app/src/main/java/com/renna/app/Notifier.kt <<'RENNA_EOF'
+          package com.renna.app
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.media.AudioAttributes
+          import android.media.RingtoneManager
+          import androidx.core.app.NotificationCompat
+
+          object Notifier {
+              private const val CHANNEL_ID = "renna_ring_v1"
+
+              fun ensureChannel(ctx: Context) {
+                  val nm = ctx.getSystemService(NotificationManager::class.java)
+                  if (nm.getNotificationChannel(CHANNEL_ID) != null) return
+                  val ch = NotificationChannel(CHANNEL_ID, ctx.getString(R.string.channel_name), NotificationManager.IMPORTANCE_HIGH)
+                  ch.description = ctx.getString(R.string.channel_desc)
+                  ch.enableVibration(true)
+                  ch.vibrationPattern = longArrayOf(0, 700, 300, 700, 300, 700)
+                  ch.lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+                  val attrs = AudioAttributes.Builder()
+                      .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                      .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                      .build()
+                  ch.setSound(RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE), attrs)
+                  nm.createNotificationChannel(ch)
+              }
+
+              fun show(ctx: Context) {
+                  ensureChannel(ctx)
+                  val open = PendingIntent.getActivity(
+                      ctx, 0, Intent(ctx, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n = NotificationCompat.Builder(ctx, CHANNEL_ID)
+                      .setSmallIcon(R.drawable.ic_notification)
+                      .setContentTitle(ctx.getString(R.string.ring_title))
+                      .setContentText(ctx.getString(R.string.ring_text))
+                      .setPriority(NotificationCompat.PRIORITY_HIGH)
+                      .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+                      .setAutoCancel(true)
+                      .setContentIntent(open)
+                      .build()
+                  try {
+                      ctx.getSystemService(NotificationManager::class.java).notify(1001, n)
+                  } catch (_: SecurityException) { }
+              }
+          }
+          RENNA_EOF
+          mkdir -p app/src/main/java/com/renna/app
+          cat > app/src/main/java/com/renna/app/RennaService.kt <<'RENNA_EOF'
+          package com.renna.app
+
+          import com.google.firebase.messaging.FirebaseMessagingService
+          import com.google.firebase.messaging.RemoteMessage
+
+          class RennaService : FirebaseMessagingService() {
+              override fun onNewToken(token: String) {
+                  val ctx = applicationContext
+                  Thread { try { Api.register(ctx, token) } catch (_: Exception) { } }.start()
+              }
+
+              override fun onMessageReceived(message: RemoteMessage) {
+                  Notifier.show(applicationContext)
+              }
+          }
+          RENNA_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/bg_field.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="@color/field" />
+              <corners android:radius="16dp" />
+              <stroke android:width="1dp" android:color="@color/muted" />
+          </shape>
+          RENNA_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <group android:translateX="30" android:translateY="30" android:scaleX="2" android:scaleY="2">
+                  <path android:fillColor="#F5B942"
+                      android:pathData="M12,22c1.1,0 2,-0.9 2,-2h-4c0,1.1 0.89,2 2,2zM18,16v-5c0,-3.07 -1.64,-5.64 -4.5,-6.32V4c0,-0.83 -0.67,-1.5 -1.5,-1.5s-1.5,0.67 -1.5,1.5v0.68C7.63,5.36 6,7.92 6,11v5l-2,2v1h16v-1l-2,-2z" />
+              </group>
+          </vector>
+          RENNA_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_notification.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp" android:height="24dp"
+              android:viewportWidth="24" android:viewportHeight="24">
+              <path android:fillColor="#FFFFFFFF"
+                  android:pathData="M12,22c1.1,0 2,-0.9 2,-2h-4c0,1.1 0.89,2 2,2zM18,16v-5c0,-3.07 -1.64,-5.64 -4.5,-6.32V4c0,-0.83 -0.67,-1.5 -1.5,-1.5s-1.5,0.67 -1.5,1.5v0.68C7.63,5.36 6,7.92 6,11v5l-2,2v1h16v-1l-2,-2z" />
+          </vector>
+          RENNA_EOF
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:app="http://schemas.android.com/apk/res-auto"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:fillViewport="true"
+              android:layoutDirection="rtl">
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="vertical"
+                  android:padding="24dp">
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:text="@string/app_name"
+                      android:textAlignment="center"
+                      android:textColor="@color/gold"
+                      android:textSize="40sp"
+                      android:textStyle="bold" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="40dp"
+                      android:text="@string/my_code"
+                      android:textAlignment="center"
+                      android:textColor="@color/muted"
+                      android:textSize="16sp" />
+
+                  <TextView
+                      android:id="@+id/tvCode"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:layoutDirection="ltr"
+                      android:letterSpacing="0.15"
+                      android:text="@string/creating_code"
+                      android:textAlignment="center"
+                      android:textColor="@color/white"
+                      android:textSize="34sp"
+                      android:textStyle="bold" />
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="16dp"
+                      android:orientation="horizontal">
+
+                      <com.google.android.material.button.MaterialButton
+                          android:id="@+id/btnCopy"
+                          style="@style/Widget.Material3.Button.OutlinedButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_marginEnd="6dp"
+                          android:layout_weight="1"
+                          android:text="@string/copy"
+                          android:textColor="@color/gold" />
+
+                      <com.google.android.material.button.MaterialButton
+                          android:id="@+id/btnShare"
+                          style="@style/Widget.Material3.Button.OutlinedButton"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_marginStart="6dp"
+                          android:layout_weight="1"
+                          android:text="@string/share"
+                          android:textColor="@color/gold" />
+                  </LinearLayout>
+
+                  <View
+                      android:layout_width="match_parent"
+                      android:layout_height="1dp"
+                      android:layout_marginTop="40dp"
+                      android:background="@color/field" />
+
+                  <TextView
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="32dp"
+                      android:text="@string/their_code"
+                      android:textAlignment="center"
+                      android:textColor="@color/muted"
+                      android:textSize="16sp" />
+
+                  <EditText
+                      android:id="@+id/etInput"
+                      android:layout_width="match_parent"
+                      android:layout_height="64dp"
+                      android:layout_marginTop="8dp"
+                      android:autofillHints="no"
+                      android:background="@drawable/bg_field"
+                      android:gravity="center"
+                      android:hint="@string/hint"
+                      android:imeOptions="actionDone"
+                      android:importantForAutofill="no"
+                      android:inputType="number"
+                      android:layoutDirection="ltr"
+                      android:maxLength="8"
+                      android:textColor="@color/white"
+                      android:textColorHint="@color/muted"
+                      android:textSize="26sp" />
+
+                  <com.google.android.material.button.MaterialButton
+                      android:id="@+id/btnRing"
+                      android:layout_width="match_parent"
+                      android:layout_height="76dp"
+                      android:layout_marginTop="20dp"
+                      android:text="@string/send_ring"
+                      android:textSize="22sp"
+                      android:textStyle="bold"
+                      app:cornerRadius="38dp" />
+
+                  <TextView
+                      android:id="@+id/tvStatus"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="20dp"
+                      android:textAlignment="center"
+                      android:textColor="@color/white"
+                      android:textSize="16sp" />
+              </LinearLayout>
+          </ScrollView>
+          RENNA_EOF
+          mkdir -p app/src/main/res/mipmap-anydpi
+          cat > app/src/main/res/mipmap-anydpi/ic_launcher.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/navy" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          RENNA_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="navy">#0F1B2D</color>
+              <color name="field">#1B2B45</color>
+              <color name="gold">#F5B942</color>
+              <color name="white">#FFFFFF</color>
+              <color name="muted">#9FB0C8</color>
+          </resources>
+          RENNA_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">رنّة</string>
+              <string name="my_code">كودي الشخصي</string>
+              <string name="their_code">كود الشخص الآخر</string>
+              <string name="hint">أدخل 8 أرقام</string>
+              <string name="send_ring">إرسال رنّة</string>
+              <string name="copy">نسخ</string>
+              <string name="share">مشاركة</string>
+              <string name="copied">تم نسخ الكود</string>
+              <string name="share_text">كودي في تطبيق رنّة: %1$s\nاكتبه في التطبيق وأرسل لي رنّة!</string>
+              <string name="creating_code">جارٍ إنشاء الكود…</string>
+              <string name="code_failed">تعذّر إنشاء الكود، تحقق من الإنترنت</string>
+              <string name="sending">جارٍ الإرسال…</string>
+              <string name="sent">تم إرسال الرنّة ✓</string>
+              <string name="err_length">الكود يجب أن يكون 8 أرقام</string>
+              <string name="err_not_found">هذا الكود غير موجود</string>
+              <string name="err_wait">انتظر قليلًا قبل إرسال رنّة أخرى</string>
+              <string name="err_network">لا يوجد اتصال بالإنترنت</string>
+              <string name="err_generic">حدث خطأ، حاول مرة أخرى</string>
+              <string name="channel_name">الرنّات</string>
+              <string name="channel_desc">تنبيهات صوتية واهتزاز عند وصول رنّة</string>
+              <string name="ring_title">رنّة! 🔔</string>
+              <string name="ring_text">أحدهم يرنّ عليك</string>
+          </resources>
+          RENNA_EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'RENNA_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Renna" parent="Theme.Material3.Dark.NoActionBar">
+                  <item name="colorPrimary">@color/gold</item>
+                  <item name="colorOnPrimary">@color/navy</item>
+                  <item name="android:windowBackground">@color/navy</item>
+                  <item name="android:statusBarColor">@color/navy</item>
+                  <item name="android:navigationBarColor">@color/navy</item>
+              </style>
+          </resources>
+          RENNA_EOF
+          cat > build.gradle.kts <<'RENNA_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+              id("com.google.gms.google-services") version "4.4.2" apply false
+          }
+          RENNA_EOF
+          cat > deploy-worker.sh <<'RENNA_EOF'
+          #!/usr/bin/env bash
+          # Deploys the Renna server to Cloudflare Workers (free) and prints its URL into GITHUB_ENV.
+          set -euo pipefail
+          export WRANGLER_SEND_METRICS=false
+          API=https://api.cloudflare.com/client/v4
+          H="Authorization: Bearer $CLOUDFLARE_API_TOKEN"
+
+          ACC=$(curl -sf -H "$H" "$API/accounts" | python3 -c "import sys,json; r=json.load(sys.stdin)['result']; print(r[0]['id'] if r else '')" || true)
+          if [ -z "$ACC" ]; then
+            echo "::error::تعذّر قراءة حساب Cloudflare. أعد إنشاء التوكن بقالب Edit Cloudflare Workers"
+            exit 1
+          fi
+          export CLOUDFLARE_ACCOUNT_ID="$ACC"
+
+          # make sure the account has a workers.dev subdomain
+          SUB=$(curl -sf -H "$H" "$API/accounts/$ACC/workers/subdomain" | python3 -c "import sys,json; print((json.load(sys.stdin).get('result') or {}).get('subdomain') or '')" || true)
+          if [ -z "$SUB" ]; then
+            NEW="renna-$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+            curl -sf -X PUT -H "$H" -H "Content-Type: application/json" -d "{\"subdomain\":\"$NEW\"}" "$API/accounts/$ACC/workers/subdomain" >/dev/null || true
+          fi
+
+          cd worker
+          find_ns() {
+            wrangler kv namespace list 2>/dev/null | python3 -c "import sys,json; l=json.load(sys.stdin); print(next((n['id'] for n in l if n['title']=='renna-codes'),''))"
+          }
+          KV=$(find_ns || true)
+          if [ -z "$KV" ]; then
+            wrangler kv namespace create renna-codes || true
+            KV=$(find_ns || true)
+          fi
+          if [ -z "$KV" ]; then
+            echo "::error::تعذّر إنشاء قاعدة البيانات (KV) في Cloudflare. تأكد أن التوكن يملك صلاحية Workers KV Storage"
+            exit 1
+          fi
+
+          cat > wrangler.toml <<TOML
+          name = "renna"
+          main = "worker.js"
+          compatibility_date = "2024-11-01"
+
+          [[kv_namespaces]]
+          binding = "RENNA"
+          id = "$KV"
+          TOML
+
+          wrangler deploy 2>&1 | tee deploy.log
+          URL=$(grep -oE 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -1 || true)
+          if [ -z "$URL" ]; then
+            echo "::error::تم النشر لكن لم أجد رابط الخادم. راجع سجل الخطوة"
+            exit 1
+          fi
+
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" | wrangler secret put FIREBASE_SERVICE_ACCOUNT
+
+          ok=0
+          for i in $(seq 1 12); do
+            if curl -sf "$URL" >/dev/null; then ok=1; break; fi
+            sleep 5
+          done
+          [ "$ok" = 1 ] && echo "Server is up: $URL" || echo "::warning::الخادم لم يستجب بعد (قد يحتاج دقائق): $URL"
+          echo "WORKER_URL=$URL" >> "$GITHUB_ENV"
+          RENNA_EOF
+          cat > gradle.properties <<'RENNA_EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          RENNA_EOF
+          cat > settings.gradle.kts <<'RENNA_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Renna"
+          include(":app")
+          RENNA_EOF
+          mkdir -p worker
+          cat > worker/worker.js <<'RENNA_EOF'
+          // Renna server - Cloudflare Worker (free tier) + KV namespace bound as RENNA
+          // Secret needed: FIREBASE_SERVICE_ACCOUNT (full JSON of the Firebase service account key)
+
+          const json = (o, s = 200) =>
+            new Response(JSON.stringify(o), { status: s, headers: { "content-type": "application/json" } });
+
+          const b64url = (buf) =>
+            btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+          let cached = { token: null, exp: 0 };
+
+          async function accessToken(sa) {
+            const now = Math.floor(Date.now() / 1000);
+            if (cached.token && cached.exp - 60 > now) return cached.token;
+            const enc = new TextEncoder();
+            const header = b64url(enc.encode(JSON.stringify({ alg: "RS256", typ: "JWT" })));
+            const claim = b64url(
+              enc.encode(
+                JSON.stringify({
+                  iss: sa.client_email,
+                  scope: "https://www.googleapis.com/auth/firebase.messaging",
+                  aud: "https://oauth2.googleapis.com/token",
+                  iat: now,
+                  exp: now + 3600,
+                })
+              )
+            );
+            const pem = sa.private_key.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+            const der = Uint8Array.from(atob(pem), (c) => c.charCodeAt(0));
+            const key = await crypto.subtle.importKey(
+              "pkcs8",
+              der,
+              { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+              false,
+              ["sign"]
+            );
+            const sig = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc.encode(`${header}.${claim}`));
+            const jwt = `${header}.${claim}.${b64url(sig)}`;
+            const r = await fetch("https://oauth2.googleapis.com/token", {
+              method: "POST",
+              headers: { "content-type": "application/x-www-form-urlencoded" },
+              body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+            });
+            const d = await r.json();
+            if (!d.access_token) throw new Error("oauth failed");
+            cached = { token: d.access_token, exp: now + (d.expires_in || 3600) };
+            return cached.token;
+          }
+
+          function newCode() {
+            const a = new Uint32Array(1);
+            crypto.getRandomValues(a);
+            return String(10000000 + (a[0] % 90000000));
+          }
+
+          async function handleRegister(req, env) {
+            const { code, secret, token } = await req.json();
+            if (!token || typeof token !== "string") return json({ error: "bad_request" }, 400);
+
+            if (code && secret && /^\d{8}$/.test(code)) {
+              const existing = await env.RENNA.get("c:" + code, "json");
+              if (existing && existing.secret !== secret) return json({ error: "forbidden" }, 403);
+              await env.RENNA.put("c:" + code, JSON.stringify({ token, secret }));
+              return json({ code, secret });
+            }
+
+            for (let i = 0; i < 10; i++) {
+              const c = newCode();
+              if (await env.RENNA.get("c:" + c)) continue;
+              const s = crypto.randomUUID().replace(/-/g, "");
+              await env.RENNA.put("c:" + c, JSON.stringify({ token, secret: s }));
+              return json({ code: c, secret: s });
+            }
+            return json({ error: "busy" }, 503);
+          }
+
+          async function handleRing(req, env) {
+            const { code } = await req.json();
+            if (!code || !/^\d{8}$/.test(code)) return json({ error: "bad_code" }, 400);
+            const rec = await env.RENNA.get("c:" + code, "json");
+            if (!rec) return json({ error: "not_found" }, 404);
+
+            const last = await env.RENNA.get("r:" + code);
+            if (last && Date.now() - Number(last) < 5000) return json({ error: "slow_down" }, 429);
+            await env.RENNA.put("r:" + code, String(Date.now()), { expirationTtl: 60 });
+
+            const sa = JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
+            const at = await accessToken(sa);
+            const r = await fetch(`https://fcm.googleapis.com/v1/projects/${sa.project_id}/messages:send`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${at}`, "content-type": "application/json" },
+              body: JSON.stringify({
+                message: {
+                  token: rec.token,
+                  data: { type: "ring" },
+                  android: { priority: "HIGH", ttl: "60s" },
+                },
+              }),
+            });
+            if (r.ok) return json({ ok: true });
+            if (r.status === 404) {
+              await env.RENNA.delete("c:" + code);
+              return json({ error: "gone" }, 410);
+            }
+            return json({ error: "fcm_failed", status: r.status }, 502);
+          }
+
+          export default {
+            async fetch(req, env) {
+              if (req.method !== "POST") return json({ name: "renna", ok: true });
+              const path = new URL(req.url).pathname;
+              try {
+                if (path === "/register") return await handleRegister(req, env);
+                if (path === "/ring") return await handleRing(req, env);
+                return json({ error: "not_found" }, 404);
+              } catch (e) {
+                return json({ error: "server_error" }, 500);
+              }
+            },
+          };
+          RENNA_EOF
+
+      - name: Deploy server to Cloudflare
+        working-directory: renna
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          npm i -g wrangler@4
+          bash deploy-worker.sh
+      - name: Add google-services.json
+        env:
+          GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: echo "$GS" > renna/app/google-services.json
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Build debug APK
+        working-directory: renna
+        run: gradle assembleDebug --stacktrace
+      - name: Rename APK
+        run: cp renna/app/build/outputs/apk/debug/app-debug.apk Renna.apk
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: Renna APK ${{ github.run_number }}
+          files: Renna.apk
