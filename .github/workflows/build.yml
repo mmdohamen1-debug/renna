@@ -19,7 +19,6 @@ jobs:
           [ -n "$GS" ] || fail "Missing secret GOOGLE_SERVICES_JSON"
           [ -n "$SA" ] || fail "Missing secret FIREBASE_SERVICE_ACCOUNT"
           [ -n "$CF" ] || fail "Missing secret CLOUDFLARE_API_TOKEN"
-          echo "$GS" | grep -q '"com.renna.app"' || fail "google-services.json does not contain package name com.renna.app"
           echo "$SA" | grep -q '"private_key"' || fail "FIREBASE_SERVICE_ACCOUNT is not a valid service account key"
       - uses: actions/setup-java@v4
         with:
@@ -621,7 +620,12 @@ jobs:
             exit 1
           fi
 
-          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" | wrangler secret put FIREBASE_SERVICE_ACCOUNT
+          printf '%s' "$FIREBASE_SERVICE_ACCOUNT" | python3 -c "
+          import sys, json
+          raw = sys.stdin.read()
+          clean = ''.join(ch for ch in raw if ch.isascii() and (ch.isprintable() or ch in '\n\r\t'))
+          print(json.dumps(json.loads(clean)))
+          " | wrangler secret put FIREBASE_SERVICE_ACCOUNT
 
           ok=0
           for i in $(seq 1 12); do
@@ -781,7 +785,26 @@ jobs:
       - name: Add google-services.json
         env:
           GS: ${{ secrets.GOOGLE_SERVICES_JSON }}
-        run: echo "$GS" > renna/app/google-services.json
+        run: |
+          python3 - <<'PY'
+          import os, json, sys
+          raw = os.environ["GS"]
+          clean = "".join(ch for ch in raw if ch.isascii() and (ch.isprintable() or ch in "\n\r\t"))
+          print("Hidden/non-ASCII characters removed:", len(raw) - len(clean))
+          try:
+              data = json.loads(clean)
+          except Exception as e:
+              print("::error::google-services.json is not valid JSON:", e)
+              sys.exit(1)
+          names = [c.get("client_info", {}).get("android_client_info", {}).get("package_name") for c in data.get("client", [])]
+          print("Package names found in file:", names)
+          if "com.renna.app" not in names:
+              print("::error::No client with package com.renna.app. Found:", names)
+              sys.exit(1)
+          with open("renna/app/google-services.json", "w") as f:
+              json.dump(data, f, indent=2)
+          print("google-services.json written OK")
+          PY
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
